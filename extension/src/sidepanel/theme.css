@@ -1,0 +1,80 @@
+/* ============================================================
+   Design tokens — dark, cool, technical (AI Studio inspired)
+   ============================================================ */
+:root {
+  /* Surfaces */
+  --bg-base: #131314;
+  --bg-surface: #1e1f20;
+  --bg-surface-raised: #26282a;
+  --bg-surface-hover: #2d2f31;
+  --border-subtle: #3c4043;
+  --border-strong: #52555a;
+
+  /* Text */
+  --text-primary: #e8eaed;
+  --text-secondary: #9aa0a6;
+  --text-tertiary: #6a6f76;
+
+  /* Accent — cap gradient */
+  --accent-blue: #8ab4f8;
+  --accent-blue-strong: #669df6;
+  --accent-purple: #9168c0;
+  --accent-gradient: linear-gradient(135deg, #8c9eff 0%, #9168c0 100%);
+
+  /* Semantic */
+  --success: #81c995;
+  --success-bg: rgba(129, 201, 149, 0.12);
+  --warning: #fdd663;
+  --warning-bg: rgba(253, 214, 99, 0.12);
+  --danger: #f28b82;
+  --danger-bg: rgba(242, 139, 130, 0.14);
+
+  /* Shape */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+  --radius-full: 999px;
+
+  /* Type */
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "Roboto Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--accent-blue);
+  color: #131314;
+}
+
+/* Focus visibility, kept even though this is a compact panel */
+:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
