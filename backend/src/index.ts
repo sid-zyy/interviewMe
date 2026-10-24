@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { interviewRouter } from "./routes/interview.js";
+import { whisperStatus } from "./lib/whisper.js";
 
 const app = express();
 const port = process.env.PORT ?? 8787;
@@ -14,9 +15,20 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// The side panel pings this to show connection + which STT engines are usable.
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: true,
+    gemini: !!process.env.GEMINI_API_KEY,
+    whisper: whisperStatus(),
+  })
+);
 app.use("/interview", interviewRouter);
 
 app.listen(port, () => {
   console.log(`Interview backend listening on http://localhost:${port}`);
+  const w = whisperStatus();
+  console.log(
+    `  Whisper: ${w.configured ? `${w.provider} (${w.model})` : "not configured — browser STT only"}`
+  );
 });

@@ -1,23 +1,42 @@
 {
   "manifest_version": 3,
-  "name": "AI Interview Practice",
-  "version": "0.1.0",
-  "description": "Practice explaining LeetCode problems out loud to an AI interviewer.",
-  "permissions": ["storage", "sidePanel", "scripting", "activeTab"],
-  "host_permissions": ["https://leetcode.com/*"],
+  "name": "interviewMe — AI Interview Practice",
+  "version": "0.2.0",
+  "description": "Practice explaining coding problems out loud to an AI interviewer on LeetCode, NeetCode, HackerRank, Codeforces, GeeksforGeeks, CodeChef and AtCoder.",
+  "permissions": ["storage", "sidePanel", "tabs"],
+  "host_permissions": [
+    "https://leetcode.com/*",
+    "https://leetcode.cn/*",
+    "https://neetcode.io/*",
+    "https://www.hackerrank.com/*",
+    "https://codeforces.com/*",
+    "https://www.geeksforgeeks.org/*",
+    "https://www.codechef.com/*",
+    "https://atcoder.jp/*",
+    "http://localhost/*"
+  ],
   "background": {
     "service_worker": "src/background/index.ts",
     "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["https://leetcode.com/problems/*"],
+      "matches": [
+        "https://leetcode.com/*",
+        "https://leetcode.cn/*",
+        "https://neetcode.io/*",
+        "https://www.hackerrank.com/*",
+        "https://codeforces.com/*",
+        "https://www.geeksforgeeks.org/*",
+        "https://www.codechef.com/*",
+        "https://atcoder.jp/*"
+      ],
       "js": ["src/content/index.ts"],
       "run_at": "document_idle"
     }
   ],
   "action": {
-    "default_title": "Open Interview Practice",
+    "default_title": "Open interviewMe",
     "default_icon": {
       "16": "public/icons/icon16.png",
       "48": "public/icons/icon48.png",

@@ -1,103 +1,162 @@
-// Runs on https://leetcode.com/problems/*
+// Runs on every supported problem site (see lib/sites.ts + manifest.json).
 // Responsibilities (Phase 2 + Phase 6):
-//   1. Scrape the problem statement into clean text
-//   2. Re-scrape on SPA navigation (LeetCode never hard-reloads)
+//   1. Scrape the problem statement into clean text via the site's adapter
+//   2. Re-scrape on SPA navigation (most of these sites never hard-reload)
 //   3. Watch for a real submission result and notify the background worker
 
 import TurndownService from "turndown";
-import type { ScrapedProblem, RuntimeMessage } from "../lib/types";
+import type { ScrapedProblem, RuntimeMessage, Difficulty } from "../lib/types";
+import { findSite, type SiteAdapter } from "../lib/sites";
 
-const turndown = new TurndownService();
+const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+turndown.remove(["script", "style", "button", "svg"] as TurndownService.Filter);
 
-// NOTE: these selectors WILL drift as LeetCode ships changes.
-// Centralizing them here makes it a one-place fix.
-const SELECTORS = {
-  title: '[data-cy="question-title"], div.text-title-large',
-  description: '[data-track-load="description_content"]',
-  difficulty: 'div[class*="text-difficulty"]',
-  submitResult: '[data-e2e-locator="submission-result"]',
-};
-
-function slugFromUrl(): string {
-  const match = window.location.pathname.match(/\/problems\/([^/]+)/);
-  return match ? match[1] : "unknown";
+function first(selectors: string[] | undefined): Element | null {
+  for (const sel of selectors ?? []) {
+    const el = document.querySelector(sel);
+    if (el && el.textContent?.trim()) return el;
+  }
+  return null;
 }
 
-function scrapeProblem(): ScrapedProblem | null {
-  const descriptionEl = document.querySelector(SELECTORS.description);
-  const titleEl = document.querySelector(SELECTORS.title);
-  if (!descriptionEl || !titleEl) return null;
+function cleanTitle(raw: string): string {
+  // "1. Two Sum" -> "Two Sum"; also collapses whitespace.
+  return raw.replace(/\s+/g, " ").replace(/^\s*[A-Z]?\d+[A-Z]?\.\s+/, "").trim();
+}
 
-  const html = descriptionEl.innerHTML;
-  const markdown = turndown.turndown(html);
+function extractConstraints(markdown: string): string[] {
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((l) => /constraints?/i.test(l) && l.length < 40);
+  const pool = start >= 0 ? lines.slice(start + 1, start + 20) : lines;
+  return pool
+    .filter((l) => /^\s*[*-]/.test(l) && /\d|<=|≤|10\^/.test(l))
+    .map((l) => l.replace(/^\s*[*-]+\s*/, "").replace(/`/g, "").trim())
+    .slice(0, 12);
+}
 
-  // Very rough constraint/example splitting — refine once you see real DOM output.
-  const constraints = markdown
-    .split("\n")
-    .filter((line) => line.trim().startsWith("*") && /\d/.test(line))
-    .map((line) => line.replace(/^\*+\s*/, "").trim());
+function extractExamples(markdown: string): string[] {
+  return Array.from(markdown.matchAll(/(?:\*\*)?Example\s*\d*:?(?:\*\*)?[\s\S]*?(?=\n\s*\n(?:\*\*)?(?:Example|Constraints)|$)/gi))
+    .map((m) => m[0].trim())
+    .filter((s) => s.length > 10)
+    .slice(0, 4);
+}
 
-  const examples = Array.from(markdown.matchAll(/Example \d+:[\s\S]*?(?=\n\n|$)/g)).map(
-    (m) => m[0].trim()
-  );
+function scrapeWith(site: SiteAdapter): ScrapedProblem | null {
+  const url = new URL(window.location.href);
+  const descriptionEl = first(site.selectors.description);
+  const titleEl = first(site.selectors.title);
+  if (!descriptionEl) return null;
 
-  const difficultyText = document.querySelector(SELECTORS.difficulty)?.textContent?.trim();
-  const difficulty =
-    difficultyText === "Easy" || difficultyText === "Medium" || difficultyText === "Hard"
-      ? difficultyText
-      : "Unknown";
+  const markdown = turndown
+    .turndown(descriptionEl.innerHTML)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (markdown.length < 40) return null; // still rendering
+
+  const diffText = first(site.selectors.difficulty)?.textContent ?? "";
+  const difficulty: Difficulty = site.parseDifficulty?.(diffText) ?? "Unknown";
 
   return {
-    source: "leetcode",
-    slug: slugFromUrl(),
-    title: titleEl.textContent?.trim() ?? "Untitled",
+    source: site.id,
+    slug: site.slug(url),
+    url: url.origin + url.pathname,
+    title: cleanTitle(titleEl?.textContent ?? document.title.split(/[-|]/)[0]),
     difficulty,
     descriptionText: markdown,
-    constraints,
-    examples,
+    constraints: extractConstraints(markdown),
+    examples: extractExamples(markdown),
   };
 }
 
-function reportProblem() {
-  const problem = scrapeProblem();
-  if (!problem) return; // page not fully loaded yet — MutationObserver will retry
-  const msg: RuntimeMessage = { type: "PROBLEM_SCRAPED", payload: problem };
-  chrome.runtime.sendMessage(msg);
+function currentSite() {
+  return findSite(window.location.href);
 }
 
-// --- SPA navigation handling -------------------------------------------------
-// LeetCode is a client-rendered React app; the URL changes without a reload.
-let lastSlug = slugFromUrl();
-const navObserver = new MutationObserver(() => {
-  const currentSlug = slugFromUrl();
-  if (currentSlug !== lastSlug) {
-    lastSlug = currentSlug;
-    setTimeout(reportProblem, 500); // give the new page time to render
-  }
-});
-navObserver.observe(document.body, { childList: true, subtree: true });
+function scrapeProblem(): ScrapedProblem | null {
+  const site = currentSite();
+  return site ? scrapeWith(site) : null;
+}
 
-// --- Submission detection (Phase 6) -----------------------------------------
-const submitObserver = new MutationObserver(() => {
-  const resultEl = document.querySelector(SELECTORS.submitResult);
-  if (!resultEl) return;
-  const text = resultEl.textContent?.toLowerCase() ?? "";
-  if (text.includes("accepted") || text.includes("wrong answer") || text.includes("error")) {
-    const msg: RuntimeMessage = {
-      type: "SUBMISSION_DETECTED",
-      payload: { slug: slugFromUrl(), passed: text.includes("accepted") },
-    };
-    chrome.runtime.sendMessage(msg);
-  }
-});
-submitObserver.observe(document.body, { childList: true, subtree: true });
+let lastReportedKey = "";
+function reportProblem(force = false) {
+  const problem = scrapeProblem();
+  if (!problem) return false;
+  const key = `${problem.source}:${problem.slug}:${problem.descriptionText.length}`;
+  if (!force && key === lastReportedKey) return true;
+  lastReportedKey = key;
+  const msg: RuntimeMessage = { type: "PROBLEM_SCRAPED", payload: problem };
+  chrome.runtime.sendMessage(msg).catch(() => {});
+  return true;
+}
 
-// --- Respond to side panel asking "what's the current problem?" -------------
+// Retry for a few seconds — SPAs render the statement well after document_idle.
+function reportWithRetry() {
+  let attempts = 0;
+  const tick = () => {
+    if (reportProblem() || ++attempts > 20) return;
+    setTimeout(tick, 400);
+  };
+  tick();
+}
+
+// --- SPA navigation + submission detection ----------------------------------
+// One debounced observer instead of two firing on every DOM mutation.
+let lastHref = window.location.href;
+let lastResultText = "";
+let pending = false;
+
+function resultSignature(site: SiteAdapter): string {
+  const sub = site.submission;
+  if (!sub) return "";
+  const el = first(sub.selector);
+  const text = (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+  // Only the verdict-ish part matters — avoids re-firing on unrelated re-renders.
+  const verdict = text.match(sub.accepted)?.[0] ?? text.match(sub.rejected)?.[0] ?? "";
+  return verdict ? `${verdict}|${text.slice(0, 160)}` : "";
+}
+
+function onDomChange() {
+  pending = false;
+  if (window.location.href !== lastHref) {
+    lastHref = window.location.href;
+    lastResultText = "";
+    lastReportedKey = "";
+    setTimeout(reportWithRetry, 300);
+    return;
+  }
+
+  const site = currentSite();
+  if (!site?.submission) return;
+  const sig = resultSignature(site);
+  if (!sig || sig === lastResultText) return;
+  lastResultText = sig;
+
+  const passed = site.submission.accepted.test(sig);
+  const msg: RuntimeMessage = {
+    type: "SUBMISSION_DETECTED",
+    payload: { slug: site.slug(new URL(window.location.href)), passed },
+  };
+  chrome.runtime.sendMessage(msg).catch(() => {});
+}
+
+const observer = new MutationObserver(() => {
+  if (pending) return;
+  pending = true;
+  setTimeout(onDomChange, 250);
+});
+observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+// --- Respond to side panel/background asking "what's the current problem?" --
 chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResponse) => {
   if (message.type === "REQUEST_CURRENT_PROBLEM") {
     sendResponse(scrapeProblem());
   }
 });
 
-// Initial load
-reportProblem();
+// Baseline any verdict already on screen (e.g. a previous "Accepted") so it
+// doesn't trigger scoring the moment the page loads.
+{
+  const site = currentSite();
+  if (site) lastResultText = resultSignature(site);
+}
+reportWithRetry();

@@ -1,302 +1,504 @@
-import { useEffect, useState, type CSSProperties } from "react";
-import { Volume2, VolumeX, SkipForward, CheckCircle2, Sparkles } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Settings as SettingsIcon, Sparkles, Volume2, VolumeX, X, RefreshCw } from "lucide-react";
 import type {
   ScrapedProblem,
   RuntimeMessage,
   InterviewScoreResponse,
+  InterviewTurnResponse,
+  HealthResponse,
+  HintState,
+  HintReason,
+  RubricComponent,
 } from "../lib/types";
+import { HINT_NAMES } from "../lib/types";
 import { api } from "../lib/api";
+import { useSettings } from "./hooks/useSettings";
 import { useSpeechSynthesis } from "./hooks/useSpeechSynthesis";
 import { useSpeechRecognition } from "./hooks/useSpeechRecognition";
+import { useWhisperRecorder } from "./hooks/useWhisperRecorder";
 import { Logo } from "./components/Logo";
-import { DifficultyBadge } from "./components/DifficultyBadge";
-import { MicButton } from "./components/MicButton";
+import { ProblemCard } from "./components/ProblemCard";
+import { Progress } from "./components/Progress";
+import { Thread, type ChatMessage } from "./components/Thread";
+import { Dock, type MicMode } from "./components/Dock";
 import { ScoreCard } from "./components/ScoreCard";
+import { SettingsSheet } from "./components/SettingsSheet";
+import { EmptyState, HowItWorks } from "./components/EmptyState";
 
-type Phase = "idle" | "reading" | "listening" | "scored";
+type Status = "idle" | "starting" | "active" | "scoring" | "scored";
+
+const EMPTY_HINT: HintState = {
+  level: 0,
+  target: null,
+  stuckStreak: 0,
+  totalHints: 0,
+  autoHints: 0,
+  maxLevelReached: 0,
+};
+const uid = () => crypto.randomUUID();
+
+function fmtClock(ms: number) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
 
 export default function App() {
+  const { settings, update: updateSettings } = useSettings();
+
   const [problem, setProblem] = useState<ScrapedProblem | null>(null);
-  const [sessionId] = useState(() => crypto.randomUUID());
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [transcriptLog, setTranscriptLog] = useState<string[]>([]);
-  const [interviewerMessage, setInterviewerMessage] = useState<string>("");
+  const [pendingProblem, setPendingProblem] = useState<ScrapedProblem | null>(null);
+  const [sessionId, setSessionId] = useState(uid);
+  const [status, setStatus] = useState<Status>("idle");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [covered, setCovered] = useState<RubricComponent[]>([]);
+  const [hint, setHint] = useState<HintState>(EMPTY_HINT);
+  const [draft, setDraft] = useState("");
+  const [thinking, setThinking] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const [score, setScore] = useState<InterviewScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [healthChecked, setHealthChecked] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
+  // Answer clock: starts when the interviewer finishes asking, stops on send.
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
+  // Last sign the candidate is working on an answer (typing, recording…);
+  // the auto-hint countdown runs from whichever is later.
+  const [lastActivityAt, setLastActivityAt] = useState(0);
 
-  const { speak, cancel: cancelSpeech, skip: skipSpeech, toggleMute, isMuted, isSpeaking } =
-    useSpeechSynthesis();
-  const { start: startListening, stop: stopListening, isSupported: sttSupported } =
-    useSpeechRecognition({
-      onResult: (text) => setTranscriptLog((prev) => [...prev, text]),
+  // Refs so async callbacks (speech end, chrome messages) see fresh values.
+  const turnStartedRef = useRef(turnStartedAt);
+  turnStartedRef.current = turnStartedAt;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const problemRef = useRef(problem);
+  problemRef.current = problem;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
+
+  const pushMessage = (m: ChatMessage) => setMessages((prev) => [...prev, m]);
+  const appendDraft = (text: string) =>
+    setDraft((prev) => {
+      const next = prev ? `${prev.trimEnd()} ${text}` : text;
+      draftRef.current = next;
+      return next;
     });
-  const [isListening, setIsListening] = useState(false);
+
+  // --- Speech out ----------------------------------------------------------
+  const tts = useSpeechSynthesis({ voiceURI: settings.voiceURI, rate: settings.speechRate });
+
+  // --- Speech in -----------------------------------------------------------
+  const whisperAvailable = !!health?.whisper.configured;
+  const browserStt = useSpeechRecognition({
+    onResult: (text) => appendDraft(text),
+    onSilence: () => {
+      if (settingsRef.current.autoSend) void sendTurn();
+    },
+    silenceSeconds: settings.silenceSeconds,
+    autoStopOnSilence: settings.autoSend,
+  });
+  const whisper = useWhisperRecorder({
+    silenceSeconds: settings.silenceSeconds,
+    autoStopOnSilence: settings.autoSend,
+    onAudio: async (blob) => {
+      setTranscribing(true);
+      try {
+        const text = await api.transcribe(blob, sessionRef.current);
+        if (text) appendDraft(text);
+        if (settingsRef.current.autoSend && draftRef.current.trim()) void sendTurn();
+      } catch (e) {
+        setError((e as Error).message);
+      } finally {
+        setTranscribing(false);
+      }
+    },
+  });
+
+  const engine: "whisper" | "browser" | "none" =
+    settings.sttEngine === "whisper" && whisperAvailable
+      ? "whisper"
+      : browserStt.isSupported
+        ? "browser"
+        : whisperAvailable
+          ? "whisper"
+          : "none";
+  const engineLabel = engine === "whisper" ? "Whisper" : engine === "browser" ? "browser speech" : "no speech engine";
+  const recording = engine === "whisper" ? whisper.isRecording : browserStt.isListening;
+
+  const startMic = useCallback(() => {
+    tts.cancel();
+    setError(null);
+    if (engine === "whisper") void whisper.start();
+    else if (engine === "browser") void browserStt.start();
+  }, [engine]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function stopMic() {
+    whisper.stop();
+    browserStt.stop();
+  }
+
+  function toggleMic() {
+    if (recording) stopMic();
+    else startMic();
+  }
+
+  const afterInterviewerSpoke = () => {
+    if (statusRef.current !== "active") return;
+    const t = Date.now();
+    setTurnStartedAt(t);
+    turnStartedRef.current = t;
+    if (settingsRef.current.handsFree) startMic();
+  };
+
+  // Stops the answer clock and returns how long the answer took, in seconds.
+  function stopTurnClock(): number | undefined {
+    const started = turnStartedRef.current;
+    setTurnStartedAt(null);
+    turnStartedRef.current = null;
+    return started === null ? undefined : Math.round((Date.now() - started) / 100) / 10;
+  }
+
+  // --- Backend health ------------------------------------------------------
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      setHealth(await api.health());
+      setHealthChecked(true);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [settings.backendBaseUrl]);
+
+  // --- Problem tracking ----------------------------------------------------
+  function receiveProblem(p: ScrapedProblem | null) {
+    const current = problemRef.current;
+    const inInterview = statusRef.current !== "idle";
+    if (!inInterview) {
+      setProblem(p);
+      setPendingProblem(null);
+      return;
+    }
+    if (p && current && p.slug === current.slug && p.source === current.source) {
+      setProblem(p);
+      return;
+    }
+    if (p) setPendingProblem(p);
+  }
 
   useEffect(() => {
-    chrome.runtime.sendMessage<RuntimeMessage>(
-      { type: "REQUEST_CURRENT_PROBLEM" },
-      (response: ScrapedProblem | null) => setProblem(response)
-    );
+    chrome.runtime.sendMessage<RuntimeMessage>({ type: "REQUEST_CURRENT_PROBLEM" }, (response: ScrapedProblem | null) => {
+      void chrome.runtime.lastError; // no-op if background is waking up
+      receiveProblem(response ?? null);
+    });
 
     const listener = (message: RuntimeMessage) => {
-      if (message.type === "PROBLEM_SCRAPED") setProblem(message.payload);
-      if (message.type === "SUBMISSION_DETECTED" && message.payload.passed) {
-        handleScore();
+      if (message.type === "PROBLEM_SCRAPED" || message.type === "ACTIVE_PROBLEM_CHANGED") {
+        receiveProblem(message.payload);
+      }
+      if (message.type === "SUBMISSION_DETECTED") {
+        const p = problemRef.current;
+        if (statusRef.current !== "active" || !p || message.payload.slug !== p.slug) return;
+        pushMessage({
+          id: uid(),
+          role: "system",
+          tone: message.payload.passed ? "ok" : "bad",
+          text: message.payload.passed ? "Submission accepted" : "Submission didn't pass",
+        });
+        if (message.payload.passed && settingsRef.current.autoScoreOnAccepted) void finish();
       }
     };
     chrome.runtime.onMessage.addListener(listener);
     return () => chrome.runtime.onMessage.removeListener(listener);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function handleStart() {
-    if (!problem) return;
+  // --- Timer ---------------------------------------------------------------
+  useEffect(() => {
+    if (status !== "active") return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [status]);
+
+  // --- Auto-hint when the answer clock runs out ----------------------------
+  // Any sign of work on an answer pushes the countdown back.
+  useEffect(() => {
+    setLastActivityAt(Date.now());
+  }, [draft, recording, transcribing]);
+
+  const autoHintArmed =
+    settings.autoHint && status === "active" && turnStartedAt !== null && hint.level < 4;
+  const hintDeadline = autoHintArmed
+    ? Math.max(turnStartedAt!, lastActivityAt) + settings.autoHintSeconds * 1000
+    : null;
+  const candidateBusy = recording || transcribing || thinking || tts.isSpeaking || !!draft.trim();
+
+  useEffect(() => {
+    if (hintDeadline === null || candidateBusy) return;
+    if (now >= hintDeadline) {
+      void askHint("timeout", (now - Math.max(turnStartedAt!, lastActivityAt)) / 1000);
+    }
+  }, [now]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- Keyboard: Space toggles the mic when not typing ---------------------
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (e.code !== "Space" || tag === "TEXTAREA" || tag === "INPUT" || tag === "SELECT" || tag === "BUTTON") return;
+      if (statusRef.current !== "active") return;
+      e.preventDefault();
+      toggleMic();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // --- Interview flow ------------------------------------------------------
+  function applyTurn(res: InterviewTurnResponse, auto = false) {
+    pushMessage({
+      id: uid(),
+      role: "interviewer",
+      text: res.message,
+      hintLevel: res.hintLevel || undefined,
+      auto: auto && !!res.hintLevel,
+    });
+    setCovered(res.checklistCovered);
+    setHint(res.hint);
+    tts.speak(res.message, afterInterviewerSpoke);
+  }
+
+  async function start() {
+    const p = problemRef.current;
+    if (!p) return;
+    setError(null);
+    setStatus("starting");
+    setThinking(true);
+    try {
+      const res = await api.startInterview(p, sessionRef.current);
+      setStatus("active");
+      statusRef.current = "active";
+      setStartedAt(Date.now());
+      setNow(Date.now());
+      applyTurn(res);
+    } catch (e) {
+      setError((e as Error).message);
+      setStatus("idle");
+    } finally {
+      setThinking(false);
+    }
+  }
+
+  async function sendTurn() {
+    const text = draftRef.current.trim();
+    if (!text || statusRef.current !== "active") return;
+    stopMic();
+    const started = turnStartedRef.current;
+    const answerSeconds = stopTurnClock();
+    setDraft("");
+    draftRef.current = "";
+    pushMessage({ id: uid(), role: "candidate", text, seconds: answerSeconds });
+    setThinking(true);
     setError(null);
     try {
-      const res = await api.startInterview(problem, sessionId);
-      setInterviewerMessage(res.message);
-      setPhase("reading");
-      speak(res.message, () => setPhase("listening"));
+      applyTurn(await api.sendTurn(sessionRef.current, text, answerSeconds));
     } catch (e) {
       setError((e as Error).message);
+      setDraft(text); // give their words back so nothing is lost
+      setTurnStartedAt(started); // and keep their clock running
+    } finally {
+      setThinking(false);
     }
   }
 
-  function handleMicStart() {
-    setIsListening(true);
-    startListening();
-  }
-
-  function handleMicStop() {
-    setIsListening(false);
-    stopListening();
-  }
-
-  async function handleSendTranscript() {
-    const combined = transcriptLog.join(" ").trim();
-    if (!combined) return;
-    setIsListening(false);
-    stopListening();
+  async function askHint(reason: HintReason = "button", idleSeconds?: number) {
+    if (statusRef.current !== "active") return;
+    // Anything already said/typed goes in first so the hint has context.
+    if (draftRef.current.trim()) {
+      await sendTurn();
+      return;
+    }
+    stopMic();
+    const started = turnStartedRef.current;
+    stopTurnClock();
+    setThinking(true);
+    setError(null);
     try {
-      const res = await api.sendTurn(sessionId, combined);
-      setInterviewerMessage(res.message);
-      setTranscriptLog([]);
-      setPhase("reading");
-      speak(res.message, () => setPhase("listening"));
+      applyTurn(await api.requestHint(sessionRef.current, reason, idleSeconds), reason === "timeout");
     } catch (e) {
       setError((e as Error).message);
+      // Restart the clock on failure so a flaky backend isn't retried every second.
+      if (started !== null) setTurnStartedAt(Date.now());
+    } finally {
+      setThinking(false);
     }
   }
 
-  async function handleScore() {
-    cancelSpeech();
-    setIsListening(false);
-    stopListening();
+  async function finish() {
+    if (statusRef.current !== "active") return;
+    tts.cancel();
+    whisper.cancel();
+    browserStt.stop();
+    stopTurnClock();
+    setStatus("scoring");
+    statusRef.current = "scoring";
+    setThinking(true);
     try {
-      const res = await api.scoreInterview(sessionId);
-      setScore(res);
-      setPhase("scored");
+      setScore(await api.scoreInterview(sessionRef.current));
+      setStatus("scored");
     } catch (e) {
       setError((e as Error).message);
+      setStatus("active");
+    } finally {
+      setThinking(false);
     }
   }
+
+  function restart(nextProblem?: ScrapedProblem | null) {
+    tts.cancel();
+    whisper.cancel();
+    browserStt.stop();
+    setSessionId(uid());
+    setStatus("idle");
+    statusRef.current = "idle";
+    setMessages([]);
+    setCovered([]);
+    setHint(EMPTY_HINT);
+    setDraft("");
+    setScore(null);
+    setError(null);
+    setStartedAt(null);
+    stopTurnClock();
+    if (nextProblem !== undefined) setProblem(nextProblem);
+    setPendingProblem(null);
+  }
+
+  // --- Derived UI state ----------------------------------------------------
+  const micMode: MicMode = transcribing
+    ? "transcribing"
+    : recording
+      ? "recording"
+      : thinking
+        ? "thinking"
+        : tts.isSpeaking
+          ? "speaking"
+          : "idle";
+  const nextHintLevel = Math.min(4, hint.level + 1) as 1 | 2 | 3 | 4;
+  const backendDown = healthChecked && !health;
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        display: "flex",
-        flexDirection: "column",
-        padding: "18px 18px 28px",
-      }}
-    >
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
-        <Logo size={26} />
-        <span style={{ fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 15 }}>
-          Interview Practice
-        </span>
-      </div>
-
-      {!problem && (
-        <div
-          style={{
-            color: "var(--text-secondary)",
-            fontSize: 13.5,
-            background: "var(--bg-surface)",
-            border: "1px solid var(--border-subtle)",
-            borderRadius: "var(--radius-md)",
-            padding: 16,
-          }}
-        >
-          Open a LeetCode problem page to get started.
+    <div className="app">
+      <header className="header">
+        <div className="brand">
+          <Logo size={24} />
+          <span className="brand-name">interview<b>Me</b></span>
         </div>
-      )}
+        <div className="header-spacer" />
+        {status === "active" && startedAt && <span className="timer" title="Elapsed">{fmtClock(now - startedAt)}</span>}
+        <span
+          className="status-pill"
+          title={health ? `Backend connected · STT: ${engineLabel}` : "Backend not reachable"}
+        >
+          <span className={`dot ${!healthChecked ? "" : !health ? "bad" : !health.gemini ? "warn" : "ok"}`} />
+          {!healthChecked ? "…" : !health ? "Offline" : engine === "whisper" ? "Whisper" : "Browser STT"}
+        </span>
+        <button className={`icon-btn${tts.isMuted ? " active" : ""}`} onClick={tts.toggleMute} title={tts.isMuted ? "Unmute interviewer" : "Mute interviewer"}>
+          {tts.isMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+        </button>
+        <button className="icon-btn" onClick={() => setShowSettings(true)} title="Settings">
+          <SettingsIcon size={16} />
+        </button>
+      </header>
 
-      {problem && (
-        <>
-          {/* Problem chip */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
-            <span style={{ fontSize: 14.5, fontWeight: 600 }}>{problem.title}</span>
-            <DifficultyBadge difficulty={problem.difficulty} />
-          </div>
-
-          {phase === "idle" && (
-            <button
-              onClick={handleStart}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 8,
-                width: "100%",
-                padding: "12px 16px",
-                borderRadius: "var(--radius-md)",
-                border: "none",
-                background: "var(--accent-gradient)",
-                color: "#131314",
-                fontSize: 14,
-                fontWeight: 600,
-                cursor: "pointer",
-              }}
-            >
-              <Sparkles size={16} />
-              Start interview
+      <main className="main">
+        {backendDown && (
+          <div className="banner error">
+            <span className="grow">
+              Can't reach the backend at <code>{settings.backendBaseUrl}</code>. Run <code>npm run dev</code> in <code>backend/</code>.
+            </span>
+            <button className="icon-btn sm" title="Retry" onClick={async () => setHealth(await api.health())}>
+              <RefreshCw size={14} />
             </button>
-          )}
+          </div>
+        )}
 
-          {/* Interviewer message bubble */}
-          {interviewerMessage && (
-            <div
-              style={{
-                marginTop: phase === "idle" ? 16 : 0,
-                marginBottom: 20,
-                background: "var(--bg-surface)",
-                border: "1px solid var(--border-subtle)",
-                borderRadius: "var(--radius-lg)",
-                padding: "14px 16px",
-                display: "flex",
-                gap: 10,
-                alignItems: "flex-start",
-              }}
-            >
-              <div style={{ flexShrink: 0, marginTop: 2 }}>
-                <Logo size={18} />
-              </div>
-              <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.5, flex: 1 }}>
-                {interviewerMessage}
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
-                <button
-                  onClick={toggleMute}
-                  title={isMuted ? "Unmute narration" : "Mute narration"}
-                  style={iconButtonStyle}
-                >
-                  {isMuted ? <VolumeX size={15} /> : <Volume2 size={15} />}
-                </button>
-                {isSpeaking && (
-                  <button onClick={skipSpeech} title="Skip narration" style={iconButtonStyle}>
-                    <SkipForward size={15} />
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
+        {pendingProblem && (
+          <div className="banner">
+            <span className="grow">
+              You switched to <b>{pendingProblem.title}</b>.
+            </span>
+            <button className="btn" style={{ height: 28 }} onClick={() => restart(pendingProblem)}>Switch</button>
+            <button className="icon-btn sm" onClick={() => setPendingProblem(null)} title="Dismiss"><X size={14} /></button>
+          </div>
+        )}
 
-          {/* Mic controls */}
-          {phase === "listening" && (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
-              {!sttSupported && (
-                <p style={{ color: "var(--danger)", fontSize: 12.5, textAlign: "center" }}>
-                  Speech recognition isn't supported here. Chrome only, per MVP scope.
-                </p>
-              )}
+        {!problem && status === "idle" && <EmptyState />}
 
-              <MicButton
-                isListening={isListening}
-                disabled={!sttSupported}
-                onStart={handleMicStart}
-                onStop={handleMicStop}
-              />
-              <span style={{ fontSize: 11.5, color: "var(--text-tertiary)" }}>
-                {isListening ? "Listening…" : "Tap to talk"}
-              </span>
+        {problem && <ProblemCard problem={problem} compact={status !== "idle"} />}
 
-              {transcriptLog.length > 0 && (
-                <p
-                  style={{
-                    fontSize: 12.5,
-                    color: "var(--text-secondary)",
-                    fontStyle: "italic",
-                    textAlign: "center",
-                    maxWidth: 280,
-                  }}
-                >
-                  {transcriptLog.join(" ")}
-                </p>
-              )}
+        {problem && status === "idle" && (
+          <section className="card hero">
+            <h2>Talk it through like it's the real thing.</h2>
+            <HowItWorks />
+            <button className="btn primary lg block" onClick={start} disabled={backendDown}>
+              <Sparkles size={16} /> Start interview
+            </button>
+          </section>
+        )}
 
-              <button
-                onClick={handleSendTranscript}
-                disabled={transcriptLog.length === 0}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  background: "transparent",
-                  border: "1px solid var(--border-strong)",
-                  color: transcriptLog.length ? "var(--text-primary)" : "var(--text-tertiary)",
-                  borderRadius: "var(--radius-full)",
-                  padding: "8px 16px",
-                  fontSize: 12.5,
-                  cursor: transcriptLog.length ? "pointer" : "not-allowed",
-                }}
-              >
-                <CheckCircle2 size={14} />
-                Done explaining
-              </button>
-            </div>
-          )}
+        {(status === "active" || status === "scoring") && (
+          <Progress covered={covered} hint={hint} onFinish={finish} finishing={status === "scoring"} />
+        )}
 
-          <div style={{ borderTop: "1px solid var(--border-subtle)", margin: "22px 0 16px" }} />
+        {status !== "idle" && status !== "scored" && (
+          <Thread messages={messages} thinking={thinking} onReplay={(t) => tts.speak(t)} />
+        )}
 
-          <button
-            onClick={handleScore}
-            style={{
-              width: "100%",
-              padding: "11px 16px",
-              borderRadius: "var(--radius-md)",
-              border: "1px solid var(--border-strong)",
-              background: "var(--bg-surface)",
-              color: "var(--text-primary)",
-              fontSize: 13.5,
-              fontWeight: 500,
-              cursor: "pointer",
-            }}
-          >
-            Score my explanation
-          </button>
+        {status === "scored" && score && <ScoreCard score={score} onRestart={() => restart()} />}
 
-          {score && <ScoreCard score={score} />}
-        </>
+        {error && (
+          <div className="banner error">
+            <span className="grow">{error}</span>
+            <button className="icon-btn sm" onClick={() => setError(null)} title="Dismiss"><X size={14} /></button>
+          </div>
+        )}
+      </main>
+
+      {status === "active" && (
+        <Dock
+          draft={draft}
+          interim={browserStt.interim}
+          onDraftChange={setDraft}
+          onSend={sendTurn}
+          onHint={() => askHint()}
+          nextHintName={`Hint · ${HINT_NAMES[nextHintLevel]}`}
+          hintDisabled={thinking || transcribing}
+          mode={micMode}
+          level={whisper.level}
+          elapsedMs={whisper.elapsedMs}
+          onMicToggle={toggleMic}
+          onSkipSpeech={tts.skip}
+          micDisabled={engine === "none"}
+          engineLabel={engineLabel}
+          autoSend={settings.autoSend}
+          silenceSeconds={settings.silenceSeconds}
+          answerMs={turnStartedAt !== null ? now - turnStartedAt : null}
+          hintInMs={hintDeadline !== null && !candidateBusy ? hintDeadline - now : null}
+          autoHintSeconds={settings.autoHintSeconds}
+        />
       )}
 
-      {error && (
-        <p style={{ color: "var(--danger)", fontSize: 12.5, marginTop: 14 }}>{error}</p>
+      {showSettings && (
+        <SettingsSheet
+          settings={settings}
+          update={updateSettings}
+          voices={tts.voices}
+          health={health}
+          onClose={() => setShowSettings(false)}
+          onTestVoice={() => tts.speak("Hi! Walk me through how you'd approach this problem.")}
+        />
       )}
     </div>
   );
 }
-
-const iconButtonStyle: CSSProperties = {
-  width: 26,
-  height: 26,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  background: "var(--bg-surface-raised)",
-  border: "1px solid var(--border-subtle)",
-  borderRadius: "var(--radius-sm)",
-  color: "var(--text-secondary)",
-  cursor: "pointer",
-};

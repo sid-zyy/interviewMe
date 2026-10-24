@@ -11,13 +11,13 @@ async function requestPermission() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     stream.getTracks().forEach((track) => track.stop());
-    statusEl.textContent = "Microphone access granted — you can close this tab.";
-    setTimeout(() => window.close(), 1200);
+    statusEl.innerHTML = `<p class="ok">Microphone access granted — head back to the side panel and tap the mic.</p>`;
+    setTimeout(() => window.close(), 1500);
   } catch (err) {
     statusEl.innerHTML = `
-      Microphone access was blocked.<br/><br/>
-      Click the mic/lock icon in the address bar and allow access,
-      then <button id="retry">try again</button>.
+      <p class="bad">Microphone access was blocked.</p>
+      <p style="margin-top:8px">Click the mic/lock icon in the address bar, allow access, then try again.</p>
+      <button id="retry">Try again</button>
     `;
     document.getElementById("retry")?.addEventListener("click", requestPermission);
     console.error("Mic permission error:", err);

@@ -1,29 +1,17 @@
-interface Props {
-  difficulty: "Easy" | "Medium" | "Hard" | "Unknown";
+import type { Difficulty, ProblemSource } from "../../lib/types";
+import { siteMeta } from "../../lib/sites";
+
+export function DifficultyBadge({ difficulty }: { difficulty: Difficulty }) {
+  if (difficulty === "Unknown") return null;
+  return <span className={`badge ${difficulty.toLowerCase()}`}>{difficulty}</span>;
 }
 
-const STYLES: Record<Props["difficulty"], { fg: string; bg: string }> = {
-  Easy: { fg: "var(--success)", bg: "var(--success-bg)" },
-  Medium: { fg: "var(--warning)", bg: "var(--warning-bg)" },
-  Hard: { fg: "var(--danger)", bg: "var(--danger-bg)" },
-  Unknown: { fg: "var(--text-secondary)", bg: "var(--bg-surface-raised)" },
-};
-
-export function DifficultyBadge({ difficulty }: Props) {
-  const style = STYLES[difficulty];
+export function SiteBadge({ source }: { source: ProblemSource }) {
+  const { label, color } = siteMeta(source);
   return (
-    <span
-      style={{
-        fontSize: 11.5,
-        fontWeight: 600,
-        letterSpacing: 0.2,
-        padding: "3px 9px",
-        borderRadius: "var(--radius-full)",
-        color: style.fg,
-        background: style.bg,
-      }}
-    >
-      {difficulty}
+    <span className="badge site">
+      <i style={{ background: color }} />
+      {label}
     </span>
   );
 }
