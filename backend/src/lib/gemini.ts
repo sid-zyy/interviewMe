@@ -9,9 +9,11 @@ import type {
 } from "../types.js";
 import { RUBRIC_COMPONENTS } from "../types.js";
 import { HINT_LADDER, planHint, commitHint, hintPenalty, answerTiming } from "./hints.js";
+import { groqChatAvailable, groqJson } from "./groq.js";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
 const MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_TIMEOUT_MS = 15_000;
 
 // Phase 7: this is the core "interviewer persona" prompt. Iterate here first
 // before touching any code — most quality gains come from prompt tuning.
@@ -76,15 +78,51 @@ interface RawTurn {
   hintLevelGiven: number;
 }
 
+const TURN_SHAPE = `{
+  "message": string,
+  "checklistCovered": array of "inputs_outputs" | "constraints" | "edge_cases" | "approach" | "complexity",
+  "stuckSignalDetected": boolean,
+  "hintLevelGiven": integer 0-4
+}`;
+
+const SCORE_SHAPE = `{
+  "scores": [{ "component": "inputs_outputs" | "constraints" | "edge_cases" | "approach" | "complexity", "score": number 0-5, "feedback": string }],
+  "overall": number 0-100,
+  "summary": string,
+  "strengths": array of string,
+  "improvements": array of string
+}`;
+
 function getModel(schema: object) {
-  return genAI.getGenerativeModel({
-    model: MODEL,
-    systemInstruction: SYSTEM_PROMPT,
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: schema as any,
+  return genAI.getGenerativeModel(
+    {
+      model: MODEL,
+      systemInstruction: SYSTEM_PROMPT,
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: schema as any,
+      },
     },
-  });
+    // Without a timeout an overloaded Gemini can hang for minutes before
+    // erroring, so the Groq fallback never gets a chance to run.
+    { timeout: GEMINI_TIMEOUT_MS }
+  );
+}
+
+// Gemini first; if it throws and a Groq key is configured, retry on Groq.
+async function generateJson<T>(prompt: string, schema: object, shape: string): Promise<T> {
+  try {
+    const result = await getModel(schema).generateContent(prompt);
+    return JSON.parse(result.response.text()) as T;
+  } catch (err) {
+    if (!groqChatAvailable()) throw err;
+    console.warn(`Gemini failed (${(err as Error).message}); falling back to Groq.`);
+    try {
+      return await groqJson<T>(SYSTEM_PROMPT, prompt, shape);
+    } catch (groqErr) {
+      throw new Error(`Gemini failed: ${(err as Error).message} | Groq fallback failed: ${(groqErr as Error).message}`);
+    }
+  }
 }
 
 function transcriptSoFar(session: Session): string {
@@ -129,9 +167,7 @@ may give a level ${plan.level} "${rung.name}" hint aimed at ${target}
 }
 
 async function runTurn(session: Session, prompt: string): Promise<RawTurn> {
-  const model = getModel(turnResponseSchema);
-  const result = await model.generateContent(prompt);
-  return JSON.parse(result.response.text()) as RawTurn;
+  return generateJson<RawTurn>(prompt, turnResponseSchema, TURN_SHAPE);
 }
 
 function finalizeTurn(
@@ -169,14 +205,12 @@ function finalizeTurn(
 }
 
 export async function getOpeningMessage(session: Session): Promise<InterviewTurnResponse> {
-  const model = getModel(turnResponseSchema);
   const prompt = `${problemBlock(session)}
 
 Greet the candidate briefly, then ask them to explain their understanding of
 the problem in their own words. One or two short sentences. hintLevelGiven = 0.`;
 
-  const result = await model.generateContent(prompt);
-  const raw = JSON.parse(result.response.text()) as RawTurn;
+  const raw = await generateJson<RawTurn>(prompt, turnResponseSchema, TURN_SHAPE);
   session.history.push({ role: "interviewer", text: raw.message });
   return {
     message: raw.message,
@@ -237,7 +271,6 @@ Give the hint now as the interviewer. Set stuckSignalDetected to false.`;
 }
 
 export async function getScore(session: Session): Promise<InterviewScoreResponse> {
-  const model = getModel(scoreResponseSchema);
   const timing = answerTiming(session);
   const prompt = `${problemBlock(session)}
 
@@ -255,11 +288,9 @@ usage is penalized separately, so don't double-count it. If pacing was a
 notable problem (long silences) or a strength (quick, clear answers), you may
 mention it in strengths/improvements.`;
 
-  const result = await model.generateContent(prompt);
-  const raw = JSON.parse(result.response.text()) as Omit<
-    InterviewScoreResponse,
-    "hintsUsed" | "hintPenalty" | "timing"
-  >;
+  const raw = await generateJson<
+    Omit<InterviewScoreResponse, "hintsUsed" | "hintPenalty" | "timing">
+  >(prompt, scoreResponseSchema, SCORE_SHAPE);
   const penalty = hintPenalty(session);
   return {
     ...raw,
